@@ -1,6 +1,6 @@
 {
-    "title": "upscale_interpolation_Runpod_hub",
-    "description": "upscale and interpolation video",
+    "title": "RunPod Studio Video Upscale and Interpolation",
+    "description": "SeedVR2 upscale-only, RIFE interpolation-only, and combined video enhancement with R2 output.",
     "type": "serverless",
     "category": "video",
     "iconUrl": "https://github.com/wlsdml1114/Engui_Studio/blob/main/assets/logo.png?raw=true",
@@ -10,7 +10,7 @@
       "containerDiskInGb": 10,
   
       "gpuCount": 1,
-      "gpuIds": "ADA_24",
+      "gpuIds": "ADA_24,ADA_32_PRO",
       "allowedCudaVersions": [
         "12.8"
       ]

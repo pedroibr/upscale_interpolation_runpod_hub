@@ -1,456 +1,449 @@
-import runpod
-from runpod.serverless.utils import rp_upload
-import os
-import websocket
+"""RunPod worker for video upscaling and frame interpolation."""
+
+from __future__ import annotations
+
 import base64
+import hashlib
 import json
-import uuid
 import logging
-import urllib.request
+import mimetypes
+import os
+import shutil
+import traceback
+import urllib.error
 import urllib.parse
-import binascii # Base64 에러 처리를 위해 import
-import time
-from PIL import Image
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
 import cv2
+import runpod
+import websocket
+from PIL import Image
 
-# 로깅 설정
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("runpod-studio-upscale-interpolation")
 
-# CUDA 검사 및 설정
-def check_cuda_availability():
-    """CUDA 사용 가능 여부를 확인하고 환경 변수를 설정합니다."""
+SERVER_ADDRESS = os.getenv("SERVER_ADDRESS", "127.0.0.1")
+COMFY_URL = f"http://{SERVER_ADDRESS}:8188"
+COMFY_ROOT = Path("/ComfyUI")
+COMFY_INPUT = COMFY_ROOT / "input"
+COMFY_OUTPUT = COMFY_ROOT / "output"
+COMFY_TEMP = COMFY_ROOT / "temp"
+WORKFLOW_DIR = Path(__file__).resolve().parent / "workflow"
+RUNPOD_VOLUME = Path("/runpod-volume")
+
+TASK_ALIASES = {
+    "upscale": "upscale",
+    "video_upscale": "upscale",
+    "interpolation": "interpolation",
+    "video_interpolation": "interpolation",
+    "upscale_and_interpolation": "upscale_and_interpolation",
+    "video_upscale_and_interpolation": "upscale_and_interpolation",
+}
+
+
+def _check_cuda() -> None:
     try:
         import torch
-        if torch.cuda.is_available():
-            logger.info("✅ CUDA is available and working")
-            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-            return True
-        else:
-            logger.error("❌ CUDA is not available")
-            raise RuntimeError("CUDA is required but not available")
-    except Exception as e:
-        logger.error(f"❌ CUDA check failed: {e}")
-        raise RuntimeError(f"CUDA initialization failed: {e}")
 
-# CUDA 검사 실행
-try:
-    cuda_available = check_cuda_availability()
-    if not cuda_available:
-        raise RuntimeError("CUDA is not available")
-except Exception as e:
-    logger.error(f"Fatal error: {e}")
-    logger.error("Exiting due to CUDA requirements not met")
-    exit(1)
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required but is not available")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        logger.info(
+            "stage=bootstrap cuda=available device=%s vram_mb=%s",
+            torch.cuda.get_device_name(0),
+            round(torch.cuda.get_device_properties(0).total_memory / 1024**2),
+        )
+    except Exception as exc:
+        logger.exception("stage=bootstrap cuda_check_failed")
+        raise RuntimeError(f"CUDA initialization failed: {exc}") from exc
 
 
-server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
-client_id = str(uuid.uuid4())
-    
-def queue_prompt(prompt):
-    url = f"http://{server_address}:8188/prompt"
-    logger.info(f"Queueing prompt to: {url}")
-    p = {"prompt": prompt, "client_id": client_id}
-    data = json.dumps(p).encode('utf-8')
-    req = urllib.request.Request(url, data=data)
-    return json.loads(urllib.request.urlopen(req).read())
+_check_cuda()
 
-def get_image(filename, subfolder, folder_type):
-    url = f"http://{server_address}:8188/view"
-    logger.info(f"Getting image from: {url}")
-    data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
-    url_values = urllib.parse.urlencode(data)
-    with urllib.request.urlopen(f"{url}?{url_values}") as response:
-        return response.read()
 
-def get_history(prompt_id):
-    url = f"http://{server_address}:8188/history/{prompt_id}"
-    logger.info(f"Getting history from: {url}")
-    with urllib.request.urlopen(url) as response:
-        return json.loads(response.read())
+def _error(stage: str, code: str, message: str) -> dict[str, Any]:
+    safe_message = str(message).replace("\n", " ")[:1000]
+    logger.error("stage=%s code=%s error=%s", stage, code, safe_message)
+    return {"error": safe_message, "stage": stage, "code": code}
 
-def get_images(ws, prompt):
-    prompt_id = queue_prompt(prompt)['prompt_id']
-    output_images = {}
-    while True:
-        out = ws.recv()
-        if isinstance(out, str):
-            message = json.loads(out)
-            if message['type'] == 'executing':
-                data = message['data']
-                if data['node'] is None and data['prompt_id'] == prompt_id:
-                    break
-        else:
-            continue
 
-    history = get_history(prompt_id)[prompt_id]
-    for node_id in history['outputs']:
-        node_output = history['outputs'][node_id]
-        images_output = []
-        if 'images' in node_output:
-            for image in node_output['images']:
-                image_data = get_image(image['filename'], image['subfolder'], image['type'])
-                # bytes 객체를 base64로 인코딩하여 JSON 직렬화 가능하게 변환
-                if isinstance(image_data, bytes):
-                    import base64
-                    image_data = base64.b64encode(image_data).decode('utf-8')
-                images_output.append(image_data)
-        output_images[node_id] = images_output
-
-    return output_images
-
-    
-def get_video_path(ws, prompt):
-    prompt_id = queue_prompt(prompt)['prompt_id']
-    while True:
-        out = ws.recv()
-        if isinstance(out, str):
-            message = json.loads(out)
-            if message['type'] == 'executing':
-                data = message['data']
-                if data['node'] is None and data['prompt_id'] == prompt_id:
-                    break
-        else:
-            continue
-
-    history = get_history(prompt_id)[prompt_id]
-    for node_id in history['outputs']:
-        node_output = history['outputs'][node_id]
-        if 'gifs' in node_output:
-            for video in node_output['gifs']:
-                # 첫 번째 비디오 파일 경로 반환
-                return video['fullpath']
-    
+def _input_value(job_input: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        value = job_input.get(name)
+        if value not in (None, ""):
+            return value
     return None
 
-def get_image_path(ws, prompt):
-    """이미지 결과의 파일 경로를 가져옵니다."""
-    prompt_id = queue_prompt(prompt)['prompt_id']
-    while True:
-        out = ws.recv()
-        if isinstance(out, str):
-            message = json.loads(out)
-            if message['type'] == 'executing':
-                data = message['data']
-                if data['node'] is None and data['prompt_id'] == prompt_id:
-                    break
-        else:
-            continue
 
-    history = get_history(prompt_id)[prompt_id]
-    for node_id in history['outputs']:
-        node_output = history['outputs'][node_id]
-        if 'images' in node_output:
-            for image in node_output['images']:
-                # 전체 경로 구성
-                filename = image['filename']
-                subfolder = image.get('subfolder', '')
-                if subfolder:
-                    full_path = os.path.join('/ComfyUI/output', subfolder, filename)
-                else:
-                    full_path = os.path.join('/ComfyUI/output', filename)
-                # 첫 번째 이미지 파일 경로 반환
-                return full_path
-    
-    return None
+def _safe_task_type(value: Any) -> str:
+    normalized = str(value or "upscale").strip().lower()
+    if normalized not in TASK_ALIASES:
+        raise ValueError(
+            "task_type must be one of: upscale, interpolation, "
+            "upscale_and_interpolation"
+        )
+    return TASK_ALIASES[normalized]
 
-def get_image_dimensions(image_path):
-    """이미지의 크기를 측정합니다."""
+
+def _safe_name(name: str, default_suffix: str) -> str:
+    parsed = urllib.parse.urlparse(name)
+    candidate = Path(parsed.path).name or f"input{default_suffix}"
+    return candidate.replace("..", "_")
+
+
+def _decode_input(job_input: dict[str, Any], task_dir: Path, input_type: str) -> Path:
+    if input_type == "video":
+        path_value = _input_value(job_input, "video_path")
+        url_value = _input_value(job_input, "video_url")
+        encoded_value = _input_value(job_input, "video_base64")
+        default_name = "input_video.mp4"
+    else:
+        path_value = _input_value(job_input, "image_path")
+        url_value = _input_value(job_input, "image_url")
+        encoded_value = _input_value(job_input, "image_base64")
+        default_name = "input_image.png"
+
+    if path_value:
+        source = Path(str(path_value)).expanduser()
+        if not source.is_file():
+            raise FileNotFoundError(f"input path does not exist: {source}")
+        destination = task_dir / source.name
+        shutil.copy2(source, destination)
+        return destination
+
+    if url_value:
+        destination = task_dir / _safe_name(str(url_value), Path(default_name).suffix)
+        urllib.request.urlretrieve(str(url_value), destination)
+        logger.info("stage=inputs_downloaded source=url type=%s", input_type)
+        return destination
+
+    if encoded_value:
+        destination = task_dir / default_name
+        try:
+            raw = base64.b64decode(str(encoded_value), validate=True)
+        except Exception as exc:
+            raise ValueError(f"invalid {input_type}_base64 payload: {exc}") from exc
+        destination.write_bytes(raw)
+        logger.info("stage=inputs_downloaded source=base64 type=%s bytes=%d", input_type, len(raw))
+        return destination
+
+    raise ValueError(
+        f"missing {input_type} input; provide {input_type}_url, "
+        f"{input_type}_base64, or {input_type}_path"
+    )
+
+
+def _image_dimensions(path: Path) -> tuple[int, int]:
+    with Image.open(path) as image:
+        return image.width, image.height
+
+
+def _video_metadata(path: Path) -> tuple[int, int, float]:
+    capture = cv2.VideoCapture(str(path))
     try:
-        with Image.open(image_path) as img:
-            width, height = img.size
-            return width, height
-    except Exception as e:
-        logger.error(f"이미지 크기 측정 실패: {e}")
-        raise
+        if not capture.isOpened():
+            raise ValueError(f"could not open video: {path}")
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+    finally:
+        capture.release()
+    if width <= 0 or height <= 0:
+        raise ValueError(f"invalid video dimensions: {width}x{height}")
+    if fps <= 0:
+        raise ValueError(f"invalid video FPS: {fps}")
+    return width, height, fps
 
-def get_video_dimensions(video_path):
-    """비디오의 크기를 측정합니다."""
-    try:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"비디오를 열 수 없습니다: {video_path}")
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
-        return width, height
-    except Exception as e:
-        logger.error(f"비디오 크기 측정 실패: {e}")
-        raise
 
-def get_video_fps(video_path):
-    """비디오의 FPS를 측정합니다."""
-    try:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"비디오를 열 수 없습니다: {video_path}")
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        cap.release()
-        return fps
-    except Exception as e:
-        logger.error(f"비디오 FPS 측정 실패: {e}")
-        raise
+def _multiple_of_16(value: int) -> int:
+    return max(16, ((int(value) + 15) // 16) * 16)
 
-def calculate_resolution(width, height):
-    """가장 짧은 곳의 2배를 resolution으로 계산합니다."""
-    min_dimension = min(width, height)
-    resolution = min_dimension * 2
-    logger.info(f"입력 크기: {width}x{height}, 최소 차원: {min_dimension}, 계산된 resolution: {resolution}")
+
+def _target_resolution(width: int, height: int, requested: Any = None) -> int:
+    raw = int(requested) if requested not in (None, "") else min(width, height) * 2
+    if raw < 16:
+        raise ValueError("target_resolution must be at least 16 pixels")
+    resolution = _multiple_of_16(raw)
+    logger.info(
+        "stage=workflow_prepared input=%dx%d target_short_side=%d aligned_multiple=16",
+        width,
+        height,
+        resolution,
+    )
     return resolution
 
-def load_workflow(workflow_path):
-    with open(workflow_path, 'r') as file:
-        return json.load(file)
+
+def _load_workflow(name: str) -> dict[str, Any]:
+    path = WORKFLOW_DIR / name
+    if not path.is_file():
+        raise FileNotFoundError(f"workflow not found: {path}")
+    return json.loads(path.read_text())
 
 
-def handler(job):
-    job_input = job.get("input", {})
-    logger.info(f"Received job input: {job_input}")
-    task_id = f"task_{uuid.uuid4()}"
-    os.makedirs(task_id, exist_ok=True)
+def _queue_prompt(prompt: dict[str, Any], client_id: str) -> str:
+    payload = {"prompt": prompt, "client_id": client_id}
+    request = urllib.request.Request(
+        f"{COMFY_URL}/prompt",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        queued = json.loads(response.read())
+    if queued.get("error"):
+        raise RuntimeError(f"ComfyUI rejected workflow: {queued['error']}")
+    prompt_id = queued.get("prompt_id")
+    if not prompt_id:
+        raise RuntimeError(f"ComfyUI did not return prompt_id: {queued}")
+    return str(prompt_id)
 
-    # 출력 형식 확인
-    output_format = job_input.get("output", "file_path")  # 기본값: file_path
-    
-    # 입력 타입 감지 (이미지 또는 비디오)
-    image_path_input = job_input.get("image_path")
-    image_url_input = job_input.get("image_url")
-    image_base64_input = job_input.get("image_base64")
-    
-    video_path_input = job_input.get("video_path")
-    video_url_input = job_input.get("video_url")
-    video_base64_input = job_input.get("video_base64")
-    
-    input_path = None
-    input_type = None  # "image" or "video"
-    task_type = None  # "image_upscale", "video_upscale", "video_upscale_and_interpolation"
-    
-    # 이미지 입력 처리
-    if image_path_input or image_url_input or image_base64_input:
-        input_type = "image"
-        task_type = "image_upscale"
-        
-        if image_path_input:
-            input_path = image_path_input
-        elif image_url_input:
-            try:
-                # URL에서 확장자 추출 시도
-                parsed_url = urllib.parse.urlparse(image_url_input)
-                path = parsed_url.path
-                ext = os.path.splitext(path)[1] or '.png'
-                input_path = os.path.join(task_id, f"input_image{ext}")
-                urllib.request.urlretrieve(image_url_input, input_path)
-                logger.info(f"이미지 URL에서 다운로드 완료: {image_url_input}")
-            except Exception as e:
-                return {"error": f"이미지 URL 다운로드 실패: {e}"}
-        elif image_base64_input:
-            try:
-                # Base64에서 이미지 형식 감지 시도 (PIL 사용)
-                decoded_data = base64.b64decode(image_base64_input)
-                # BytesIO를 사용하여 PIL로 형식 감지
-                from io import BytesIO
-                img = Image.open(BytesIO(decoded_data))
-                img_format = img.format.lower() if img.format else 'png'
-                ext = f'.{img_format}'
-                input_path = os.path.join(task_id, f"input_image{ext}")
-                with open(input_path, 'wb') as f:
-                    f.write(decoded_data)
-                logger.info(f"Base64 이미지를 '{input_path}' 파일로 저장했습니다.")
-            except Exception as e:
-                # 실패 시 기본값으로 .png 사용
-                input_path = os.path.join(task_id, "input_image.png")
-                with open(input_path, 'wb') as f:
-                    f.write(base64.b64decode(image_base64_input))
-                logger.info(f"Base64 이미지를 '{input_path}' 파일로 저장했습니다 (기본 형식).")
-    
-    # 비디오 입력 처리
-    elif video_path_input or video_url_input or video_base64_input:
-        input_type = "video"
-        
-        # 작업 타입 확인 (기본값: upscale)
-        task_type_input = job_input.get("task_type", "upscale")
-        if task_type_input == "upscale_and_interpolation":
-            task_type = "video_upscale_and_interpolation"
-        else:
-            task_type = "video_upscale"
-        
-        if video_path_input:
-            input_path = video_path_input
-        elif video_url_input:
-            try:
-                input_path = os.path.join(task_id, "input_video.mp4")
-                urllib.request.urlretrieve(video_url_input, input_path)
-                logger.info(f"비디오 URL에서 다운로드 완료: {video_url_input}")
-            except Exception as e:
-                return {"error": f"비디오 URL 다운로드 실패: {e}"}
-        elif video_base64_input:
-            try:
-                input_path = os.path.join(task_id, "input_video.mp4")
-                decoded_data = base64.b64decode(video_base64_input)
-                with open(input_path, 'wb') as f:
-                    f.write(decoded_data)
-                logger.info(f"Base64 비디오를 '{input_path}' 파일로 저장했습니다.")
-            except Exception as e:
-                return {"error": f"Base64 비디오 디코딩 실패: {e}"}
-    else:
-        return {"error": "입력이 필요합니다. (image_path/image_url/image_base64 또는 video_path/video_url/video_base64 중 하나)"}
-    
-    # 입력 파일 크기 측정 및 resolution 계산
-    video_fps = None
+
+def _get_history(prompt_id: str) -> dict[str, Any]:
+    with urllib.request.urlopen(f"{COMFY_URL}/history/{prompt_id}", timeout=30) as response:
+        history = json.loads(response.read())
+    if prompt_id not in history:
+        raise RuntimeError(f"ComfyUI history is missing prompt {prompt_id}")
+    return history[prompt_id]
+
+
+def _wait_for_workflow(prompt: dict[str, Any], client_id: str) -> dict[str, Any]:
+    prompt_id = _queue_prompt(prompt, client_id)
+    logger.info("stage=sampling prompt_id=%s", prompt_id)
+    socket = websocket.WebSocket()
+    socket.settimeout(5)
     try:
-        if input_type == "image":
-            width, height = get_image_dimensions(input_path)
-        else:  # video
-            width, height = get_video_dimensions(input_path)
-            # interpolation을 사용하는 경우 FPS도 측정
-            if task_type == "video_upscale_and_interpolation":
-                video_fps = get_video_fps(input_path)
-                logger.info(f"원본 비디오 FPS: {video_fps}")
-        
-        resolution = calculate_resolution(width, height)
-    except Exception as e:
-        return {"error": f"입력 파일 크기 측정 실패: {e}"}
-    
-    # 워크플로우 로드 및 설정
-    workflow_dir = os.path.join(os.path.dirname(__file__), "workflow")
-    
-    if task_type == "image_upscale":
-        workflow_path = os.path.join(workflow_dir, "image_upscale.json")
-        prompt = load_workflow(workflow_path)
-        # 노드 16: LoadImage에 이미지 경로 설정
-        prompt["16"]["inputs"]["image"] = os.path.basename(input_path)
-        # 노드 10: SeedVR2VideoUpscaler에 resolution 설정
-        prompt["10"]["inputs"]["resolution"] = resolution
-    elif task_type == "video_upscale":
-        workflow_path = os.path.join(workflow_dir, "video_upscale_api.json")
-        prompt = load_workflow(workflow_path)
-        # 노드 21: LoadVideo에 비디오 경로 설정
-        prompt["21"]["inputs"]["file"] = os.path.basename(input_path)
-        # 노드 10: SeedVR2VideoUpscaler에 resolution 설정
-        prompt["10"]["inputs"]["resolution"] = resolution
-    elif task_type == "video_upscale_and_interpolation":
-        workflow_path = os.path.join(workflow_dir, "video_upscale_interpolation_api.json")
-        prompt = load_workflow(workflow_path)
-        # 노드 21: LoadVideo에 비디오 경로 설정
-        prompt["21"]["inputs"]["file"] = os.path.basename(input_path)
-        # 노드 10: SeedVR2VideoUpscaler에 resolution 설정
-        prompt["10"]["inputs"]["resolution"] = resolution
-        # 노드 25: VHS_VideoCombine에 원본 FPS의 2배 설정
-        if video_fps is not None:
-            doubled_fps = video_fps * 2
-            prompt["25"]["inputs"]["frame_rate"] = doubled_fps
-            logger.info(f"Video Combine에 FPS 설정: {doubled_fps} (원본 FPS {video_fps}의 2배)")
-        else:
-            logger.warning("FPS를 측정할 수 없어 기본값을 사용합니다.")
+        socket.connect(f"ws://{SERVER_ADDRESS}:8188/ws?clientId={client_id}", timeout=30)
+        while True:
+            try:
+                raw = socket.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            if not isinstance(raw, str):
+                continue
+            message = json.loads(raw)
+            message_type = message.get("type")
+            data = message.get("data", {})
+            if message_type == "execution_error" and data.get("prompt_id") == prompt_id:
+                node_id = data.get("node_id")
+                error = data.get("exception_message") or data.get("error") or "unknown execution error"
+                raise RuntimeError(f"ComfyUI execution error at node {node_id}: {error}")
+            if message_type == "execution_interrupted" and data.get("prompt_id") == prompt_id:
+                raise RuntimeError("ComfyUI execution was interrupted")
+            if (
+                message_type == "executing"
+                and data.get("node") is None
+                and data.get("prompt_id") == prompt_id
+            ):
+                break
+        history = _get_history(prompt_id)
+        logger.info("stage=encoding prompt_id=%s output_nodes=%s", prompt_id, list((history.get("outputs") or {}).keys()))
+        return history
+    finally:
+        socket.close()
+
+
+def _output_root(folder_type: str) -> Path:
+    return {"output": COMFY_OUTPUT, "temp": COMFY_TEMP, "input": COMFY_INPUT}.get(
+        folder_type, COMFY_OUTPUT
+    )
+
+
+def _resolve_output_item(item: Any) -> Path | None:
+    if not isinstance(item, dict):
+        return None
+    fullpath = item.get("fullpath")
+    if fullpath and Path(fullpath).is_file():
+        return Path(fullpath)
+    filename = item.get("filename")
+    if not filename:
+        return None
+    candidate = (_output_root(str(item.get("type", "output"))) / str(item.get("subfolder", "")) / str(filename)).resolve()
+    allowed_roots = [COMFY_OUTPUT.resolve(), COMFY_TEMP.resolve(), COMFY_INPUT.resolve()]
+    if not any(candidate == root or root in candidate.parents for root in allowed_roots):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _find_video(history: dict[str, Any]) -> Path:
+    outputs = history.get("outputs") or {}
+    for node_id, node_output in outputs.items():
+        if not isinstance(node_output, dict):
+            continue
+        logger.info("stage=encoding node=%s output_keys=%s", node_id, list(node_output.keys()))
+        for key in ("gifs", "videos"):
+            for item in node_output.get(key, []) or []:
+                path = _resolve_output_item(item)
+                if path:
+                    return path
+    raise FileNotFoundError(
+        "ComfyUI completed without a readable video output; "
+        f"output_keys={[(node, list(value.keys())) for node, value in outputs.items() if isinstance(value, dict)]}"
+    )
+
+
+def _find_image(history: dict[str, Any]) -> Path:
+    outputs = history.get("outputs") or {}
+    for node_id, node_output in outputs.items():
+        if not isinstance(node_output, dict):
+            continue
+        logger.info("stage=encoding node=%s output_keys=%s", node_id, list(node_output.keys()))
+        for item in node_output.get("images", []) or []:
+            path = _resolve_output_item(item)
+            if path:
+                return path
+    raise FileNotFoundError("ComfyUI completed without a readable image output")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _env_first(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
+def _upload_r2(path: Path, job_id: str, task_type: str) -> dict[str, Any]:
+    import boto3
+    from botocore.config import Config
+
+    bucket = _env_first("R2_BUCKET", "S3_BUCKET")
+    access_key = _env_first("R2_ACCESS_KEY_ID", "S3_ACCESS_KEY_ID")
+    secret_key = _env_first("R2_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY")
+    endpoint = _env_first("R2_ENDPOINT_URL", "S3_ENDPOINT_URL")
+    if not bucket or not access_key or not secret_key or not endpoint:
+        raise RuntimeError("R2/S3 configuration is incomplete")
+    day = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+    key = f"runpod-studio/upscale-interpolation/{task_type}/{day}/{job_id}{path.suffix.lower()}"
+    mime_type = mimetypes.guess_type(path.name)[0] or "video/mp4"
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name=_env_first("R2_REGION", "S3_REGION") or "auto",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4", retries={"max_attempts": 5}),
+    )
+    logger.info("stage=uploading provider=r2 bucket=%s key=%s", bucket, key)
+    client.upload_file(str(path), bucket, key, ExtraArgs={"ContentType": mime_type})
+    public_base = (_env_first("R2_PUBLIC_BASE_URL", "S3_PUBLIC_BASE_URL") or "").rstrip("/")
+    if public_base:
+        url = f"{public_base}/{urllib.parse.quote(key)}"
     else:
-        return {"error": f"지원하지 않는 작업 타입입니다: {task_type}"}
+        ttl = int(_env_first("R2_PRESIGNED_TTL_S", "S3_PRESIGNED_TTL_S") or "3600")
+        url = client.generate_presigned_url(
+            "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=ttl
+        )
+    return {"url": url, "key": key, "provider": "r2", "mime_type": mime_type, "bytes": path.stat().st_size, "sha256": _sha256(path)}
 
-    # 입력 파일을 ComfyUI의 입력 디렉토리로 복사
-    comfyui_input_dir = "/ComfyUI/input"
-    os.makedirs(comfyui_input_dir, exist_ok=True)
-    import shutil
-    input_filename = os.path.basename(input_path)
-    comfyui_input_path = os.path.join(comfyui_input_dir, input_filename)
-    shutil.copy2(input_path, comfyui_input_path)
-    logger.info(f"입력 파일을 ComfyUI 입력 디렉토리로 복사: {comfyui_input_path}")
-    
-    # ComfyUI 서버 연결 및 처리
-    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
-    logger.info(f"Connecting to WebSocket: {ws_url}")
-    
-    # 먼저 HTTP 연결이 가능한지 확인
-    http_url = f"http://{server_address}:8188/"
-    logger.info(f"Checking HTTP connection to: {http_url}")
-    
-    # HTTP 연결 확인 (최대 1분)
-    max_http_attempts = 180
-    for http_attempt in range(max_http_attempts):
-        try:
-            response = urllib.request.urlopen(http_url, timeout=5)
-            logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}")
-            if http_attempt == max_http_attempts - 1:
-                raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
-            time.sleep(1)
-    
-    ws = websocket.WebSocket()
-    # 웹소켓 연결 시도 (최대 3분)
-    max_attempts = int(180/5)  # 3분 (5초에 한 번씩 시도)
-    for attempt in range(max_attempts):
-        try:
-            ws.connect(ws_url)
-            logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
-            if attempt == max_attempts - 1:
-                raise Exception("웹소켓 연결 시간 초과 (3분)")
-            time.sleep(5)
-    
-    # 입력 타입에 따라 결과 가져오기
-    if input_type == "image":
-        result_path = get_image_path(ws, prompt)
-        result_key = "image_path"
-        result_base64_key = "image"
-    else:  # video
-        result_path = get_video_path(ws, prompt)
-        result_key = "video_path"
-        result_base64_key = "video"
-    
-    ws.close()
 
-    # 결과가 없는 경우 처리
-    if not result_path:
-        return {"error": f"{input_type}를 생성할 수 없습니다."}
-    
-    # 출력 형식에 따라 처리
-    if output_format == "base64":
-        # Base64 인코딩하여 반환
-        try:
-            with open(result_path, 'rb') as f:
-                result_data = base64.b64encode(f.read()).decode('utf-8')
-            
-            logger.info(f"{input_type}를 Base64로 인코딩하여 반환했습니다.")
-            return {result_base64_key: result_data}
-            
-        except Exception as e:
-            logger.error(f"{input_type} Base64 인코딩 실패: {e}")
-            return {"error": f"{input_type} 인코딩 실패: {e}"}
-    else:
-        # 기본값: 파일 경로 반환
-        # 결과 파일을 runpod-volume으로 복사
-        logger.info(f"원본 결과 {input_type} 경로: {result_path}")
-        try:
-            import shutil
-            # runpod-volume 디렉토리 생성
-            runpod_volume_dir = "/runpod-volume"
-            os.makedirs(runpod_volume_dir, exist_ok=True)
-            
-            # 파일명 생성 (task_id와 원본 확장자 사용)
-            original_filename = os.path.basename(result_path)
-            file_ext = os.path.splitext(original_filename)[1]
-            output_filename = f"upscale_{task_id}{file_ext}"
-            output_path = os.path.join(runpod_volume_dir, output_filename)
-            
-            # 파일 복사
-            logger.info(f"결과 파일을 runpod-volume으로 복사 중: {result_path} -> {output_path}")
-            shutil.copy2(result_path, output_path)
-            
-            # 복사 확인
-            if os.path.exists(output_path):
-                file_size = os.path.getsize(output_path)
-                logger.info(f"✅ 결과 {input_type}를 '{output_path}'에 성공적으로 복사했습니다 (크기: {file_size} bytes)")
-                return {result_key: output_path}
-            else:
-                logger.error(f"파일 복사 실패: {output_path}가 존재하지 않습니다.")
-                return {"error": f"결과 파일 복사 실패"}
-                
-        except Exception as e:
-            logger.error(f"runpod-volume으로 파일 복사 실패: {e}")
-            # 복사 실패 시 원본 경로 반환 (fallback)
-            logger.warning(f"원본 경로를 반환합니다: {result_path}")
-            return {result_key: result_path}
+def _publish(path: Path, output: str, task_id: str, task_type: str) -> dict[str, Any]:
+    if output in {"s3", "r2"}:
+        return _upload_r2(path, task_id, task_type)
+    if output in {"base64", "data_url"}:
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        if output == "data_url":
+            mime = mimetypes.guess_type(path.name)[0] or "video/mp4"
+            return {"url": f"data:{mime};base64,{encoded}", "provider": "inline"}
+        return {"video": encoded, "provider": "inline"}
+    RUNPOD_VOLUME.mkdir(parents=True, exist_ok=True)
+    destination = RUNPOD_VOLUME / f"upscale_{task_id}{path.suffix.lower()}"
+    shutil.copy2(path, destination)
+    logger.info("stage=completed output_path=%s bytes=%d", destination, destination.stat().st_size)
+    return {"video_path": str(destination), "provider": "runpod_volume"}
 
-runpod.serverless.start({"handler": handler})
+
+def _prepare_workflow(task_type: str, input_name: str, width: int, height: int, fps: float, job_input: dict[str, Any]) -> dict[str, Any]:
+    if task_type == "upscale":
+        workflow = _load_workflow("video_upscale_api.json")
+        workflow["10"]["inputs"]["resolution"] = _target_resolution(width, height, job_input.get("target_resolution"))
+        workflow["21"]["inputs"]["file"] = input_name
+        workflow["25"]["inputs"]["frame_rate"] = fps
+        return workflow
+    if task_type == "interpolation":
+        workflow = _load_workflow("video_interpolation_api.json")
+        workflow["21"]["inputs"]["file"] = input_name
+        multiplier = int(job_input.get("fps_multiplier", 2))
+        if multiplier != 2:
+            raise ValueError("fps_multiplier currently supports only 2")
+        workflow["26"]["inputs"]["multiplier"] = multiplier
+        workflow["25"]["inputs"]["frame_rate"] = fps * multiplier
+        return workflow
+    workflow = _load_workflow("video_upscale_interpolation_api.json")
+    workflow["10"]["inputs"]["resolution"] = _target_resolution(width, height, job_input.get("target_resolution"))
+    workflow["21"]["inputs"]["file"] = input_name
+    workflow["26"]["inputs"]["multiplier"] = 2
+    workflow["25"]["inputs"]["frame_rate"] = fps * 2
+    return workflow
+
+
+def _handle_video(job_input: dict[str, Any], task_id: str, task_dir: Path) -> dict[str, Any]:
+    task_type = _safe_task_type(job_input.get("task_type"))
+    input_path = _decode_input(job_input, task_dir, "video")
+    COMFY_INPUT.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(input_path, COMFY_INPUT / input_path.name)
+    width, height, fps = _video_metadata(input_path)
+    logger.info("stage=inputs_downloaded task_type=%s input=%s dimensions=%dx%d fps=%.4f", task_type, input_path.name, width, height, fps)
+    prompt = _prepare_workflow(task_type, input_path.name, width, height, fps, job_input)
+    history = _wait_for_workflow(prompt, str(uuid.uuid4()))
+    result_path = _find_video(history)
+    output = str(job_input.get("output") or job_input.get("output_mode") or "file_path").lower()
+    result = _publish(result_path, output, task_id, task_type)
+    result.update({"task_type": task_type, "input_width": width, "input_height": height, "input_fps": fps, "output_fps": fps * (2 if task_type in {"interpolation", "upscale_and_interpolation"} else 1)})
+    return result
+
+
+def _handle_image(job_input: dict[str, Any], task_id: str, task_dir: Path) -> dict[str, Any]:
+    input_path = _decode_input(job_input, task_dir, "image")
+    COMFY_INPUT.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(input_path, COMFY_INPUT / input_path.name)
+    width, height = _image_dimensions(input_path)
+    workflow = _load_workflow("image_upscale.json")
+    workflow["16"]["inputs"]["image"] = input_path.name
+    workflow["10"]["inputs"]["resolution"] = _target_resolution(width, height, job_input.get("target_resolution"))
+    history = _wait_for_workflow(workflow, str(uuid.uuid4()))
+    result_path = _find_image(history)
+    output = str(job_input.get("output") or job_input.get("output_mode") or "file_path").lower()
+    result = _publish(result_path, output, task_id, "image_upscale")
+    result.update({"task_type": "image_upscale", "input_width": width, "input_height": height})
+    return result
+
+
+def handler(job: dict[str, Any]) -> dict[str, Any]:
+    job_input = job.get("input") or {}
+    task_id = str(job.get("id") or f"task_{uuid.uuid4()}")
+    task_dir = Path("/tmp/runpod-studio") / task_id.replace("/", "_")
+    task_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        has_image = any(_input_value(job_input, name) for name in ("image_path", "image_url", "image_base64"))
+        has_video = any(_input_value(job_input, name) for name in ("video_path", "video_url", "video_base64"))
+        if has_image == has_video:
+            return _error("inputs", "invalid_input", "provide exactly one image or video input")
+        if has_image:
+            return _handle_image(job_input, task_id, task_dir)
+        return _handle_video(job_input, task_id, task_dir)
+    except FileNotFoundError as exc:
+        return _error("encoding", "output_not_found", str(exc))
+    except urllib.error.URLError as exc:
+        return _error("inputs", "download_failed", str(exc.reason))
+    except Exception as exc:
+        logger.error("stage=failed traceback=%s", traceback.format_exc(limit=8))
+        return _error("processing", "worker_error", str(exc))
+    finally:
+        if os.getenv("DEBUG_KEEP_TEMP", "0") != "1":
+            shutil.rmtree(task_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})

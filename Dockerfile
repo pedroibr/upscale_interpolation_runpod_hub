@@ -1,61 +1,13 @@
-# Use specific version of nvidia cuda image
-FROM wlsdml1114/engui_genai-base_ada_flash:1.1 as runtime
+# Thin overlay: CUDA, ComfyUI, custom nodes, and model layers come from the
+# exact upstream v1.8 image that passed the startup checks.
+FROM registry.runpod.net/wlsdml1114-upscale-interpolation-runpod-hub-main-dockerfile@sha256:1df5cc3c8a1c0d879e898dddb4e83ae41bfb48944c452a708ea2556733d87909
 
-RUN pip install -U "huggingface_hub[hf_transfer]"
-RUN pip install runpod websocket-client
+USER root
+RUN pip install --no-cache-dir boto3
 
-WORKDIR /
+COPY handler.py /handler.py
+COPY workflow/video_interpolation_api.json /workflow/video_interpolation_api.json
 
-RUN git clone https://github.com/comfyanonymous/ComfyUI.git && \
-    cd /ComfyUI && \
-    pip install -r requirements.txt
+RUN python -m py_compile /handler.py
 
-RUN cd /ComfyUI/custom_nodes && \
-    git clone https://github.com/Comfy-Org/ComfyUI-Manager.git && \
-    cd ComfyUI-Manager && \
-    pip install -r requirements.txt
-    
-RUN cd /ComfyUI/custom_nodes && \
-    git clone https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git
-
-RUN cd /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation && \
-    python install.py
-
-RUN cd /ComfyUI/custom_nodes && \
-    git clone https://github.com/chflame163/ComfyUI_LayerStyle.git && \
-    cd ComfyUI_LayerStyle && \
-    pip install -r requirements.txt
-
-RUN cd /ComfyUI/custom_nodes && \
-    git clone https://github.com/kijai/ComfyUI-KJNodes && \
-    cd ComfyUI-KJNodes && \
-    pip install -r requirements.txt
-
-RUN cd /ComfyUI/custom_nodes && \
-    git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite && \
-    cd ComfyUI-VideoHelperSuite && \
-    pip install -r requirements.txt
-
-RUN cd /ComfyUI/custom_nodes && \
-    git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler && \
-    cd ComfyUI-SeedVR2_VideoUpscaler && \
-    pip install -r requirements.txt
-
-
-RUN mkdir -p /ComfyUI/models/SEEDVR2
-
-# RUN wget https://huggingface.co/Kim2091/2x-AnimeSharpV4/resolve/main/2x-AnimeSharpV4_Fast_RCAN_PU.safetensors -O /ComfyUI/models/upscale_models/2x-AnimeSharpV4_Fast_RCAN_PU.safetensors
-RUN wget https://huggingface.co/AInVFX/SeedVR2_comfyUI/resolve/main/seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors -O /ComfyUI/models/SEEDVR2/seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors
-# RUN wget https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors -O /ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp8_e4m3fn.safetensors
-RUN wget https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/ema_vae_fp16.safetensors -O /ComfyUI/models/SEEDVR2/ema_vae_fp16.safetensors
-RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife && wget https://huggingface.co/hfmaster/models-moved/resolve/cab6dcee2fbb05e190dbb8f536fbdaa489031a14/rife/rife49.pth -O /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/rife49.pth
-
-
-WORKDIR /
-
-COPY . .
-RUN mkdir -p /ComfyUI/user/default/ComfyUI-Manager
-COPY config.ini /ComfyUI/user/default/ComfyUI-Manager/config.ini
-RUN chmod +x /entrypoint.sh
-
-CMD ["/entrypoint.sh"]
+# Keep the upstream CMD/entrypoint: it starts ComfyUI and then /handler.py.

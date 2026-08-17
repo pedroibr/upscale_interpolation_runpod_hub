@@ -1,7 +1,9 @@
-# Video Upscale & Frame Interpolation for RunPod Serverless
+# RunPod Studio — Video Upscale & Frame Interpolation
 [한국어 README 보기](README_kr.md)
 
-This project is a RunPod Serverless template for video upscaling and frame interpolation using ComfyUI.
+This RunPod Studio fork keeps the upstream CUDA, ComfyUI, custom nodes, and
+model layers while adding a stable handler for upscale-only, interpolation-only,
+and combined video processing. It also supports direct Cloudflare R2 output.
 
 [![Runpod](https://api.runpod.io/badge/wlsdml1114/upscale_interpolation_runpod_hub)](https://console.runpod.io/hub/wlsdml1114/upscale_interpolation_runpod_hub)
 
@@ -22,20 +24,38 @@ This InfiniteTalk template is primarily designed for **Engui Studio**, a compreh
 ## ✨ Key Features
 
 *   **Video Upscaling**: High-quality video upscaling for resolution enhancement
-*   **Frame Interpolation**: Natural frame interpolation using RIFE model
+*   **Frame Interpolation**: RIFE-only mode that preserves resolution and doubles FPS
+*   **Combined Enhancement**: SeedVR2 upscale followed by RIFE interpolation
 *   **ComfyUI Integration**: Flexible workflow management based on ComfyUI
 *   **VHS Support**: Efficient video processing using Video Helper Suite
 *   **Multiple Input Formats**: Support for Base64, URL, and file path inputs
 
 ## 🚀 RunPod Serverless Template
 
+### RunPod Studio task contract
+
+The handler accepts these video tasks:
+
+| `task_type` | Behavior |
+| --- | --- |
+| `upscale` | SeedVR2 upscale; FPS unchanged |
+| `interpolation` | RIFE interpolation; resolution unchanged and FPS ×2 |
+| `upscale_and_interpolation` | SeedVR2 followed by RIFE; resolution ×2 and FPS ×2 |
+
+`target_resolution` is an optional SeedVR2 shortest-edge target and is rounded
+up to a multiple of 16. Use `output: "s3"` or `output: "r2"` in production to
+upload directly to Cloudflare R2. The worker reads `R2_*` or the existing
+`S3_*` environment variables. See [CONTRACT.md](CONTRACT.md) for the complete
+Gateway contract and secret configuration.
+
 This template includes all necessary components to run video upscaling and frame interpolation as a RunPod Serverless Worker.
 
 *   **Dockerfile**: Environment configuration and installation of all dependencies required for model execution
 *   **handler.py**: Handler function that processes requests for RunPod Serverless
 *   **entrypoint.sh**: Performs initialization tasks when the worker starts
-*   **upscale.json**: Video upscaling only workflow configuration
-*   **upscale_and_interpolation.json**: Upscaling + frame interpolation workflow configuration
+*   **workflow/video_upscale_api.json**: SeedVR2 upscale-only workflow
+*   **workflow/video_interpolation_api.json**: RIFE interpolation-only workflow
+*   **workflow/video_upscale_interpolation_api.json**: SeedVR2 + RIFE workflow
 
 ### Input
 
