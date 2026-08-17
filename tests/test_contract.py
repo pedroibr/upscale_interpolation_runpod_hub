@@ -55,6 +55,10 @@ class WorkerContractTests(unittest.TestCase):
         self.assertNotIn("10", workflow)
         self.assertEqual(workflow["25"]["inputs"]["frame_rate"], 48.0)
         self.assertEqual(workflow["26"]["inputs"]["multiplier"], 2)
+        self.assertEqual(
+            {key: workflow["26"]["inputs"][key] for key in ("dtype", "torch_compile", "batch_size")},
+            {"dtype": "float32", "torch_compile": False, "batch_size": 1},
+        )
 
     def test_upscale_preserves_fps_and_aligns_resolution(self):
         workflow = self.worker._prepare_workflow("upscale", "input.mp4", 1280, 704, 23.976, {})
@@ -68,6 +72,9 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(workflow["10"]["inputs"]["resolution"], 1408)
         self.assertEqual(workflow["25"]["inputs"]["frame_rate"], 48.0)
         self.assertEqual(workflow["26"]["inputs"]["frames"], ["10", 0])
+        self.assertEqual(workflow["26"]["inputs"]["dtype"], "float32")
+        self.assertFalse(workflow["26"]["inputs"]["torch_compile"])
+        self.assertEqual(workflow["26"]["inputs"]["batch_size"], 1)
 
 
 if __name__ == "__main__":

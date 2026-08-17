@@ -52,5 +52,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # The image contains roughly 20 GB of model layers. Exporting those
+          # layers to the GitHub Actions cache can exceed the cache SAS-token
+          # lifetime and fail the workflow after the image was already pushed.
+          # The registry image is the durable cache; skip the oversized GHA
+          # cache export so the publish result reflects the actual image push.
