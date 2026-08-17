@@ -1,9 +1,11 @@
 # RunPod Studio — Video Upscale & Frame Interpolation
 [한국어 README 보기](README_kr.md)
 
-This RunPod Studio fork keeps the upstream CUDA, ComfyUI, custom nodes, and
-model layers while adding a stable handler for upscale-only, interpolation-only,
-and combined video processing. It also supports direct Cloudflare R2 output.
+This RunPod Studio fork builds an independent image containing the CUDA base,
+pinned ComfyUI/custom nodes, SeedVR2 and RIFE weights, and a stable handler for
+upscale-only, interpolation-only, and combined video processing. It also
+supports direct Cloudflare R2 output. The expensive model layers are built once
+and reused by later handler-only image releases.
 
 [![Runpod](https://api.runpod.io/badge/wlsdml1114/upscale_interpolation_runpod_hub)](https://console.runpod.io/hub/wlsdml1114/upscale_interpolation_runpod_hub)
 
@@ -31,6 +33,20 @@ This InfiniteTalk template is primarily designed for **Engui Studio**, a compreh
 *   **Multiple Input Formats**: Support for Base64, URL, and file path inputs
 
 ## 🚀 RunPod Serverless Template
+
+### Building our own image
+
+The production `Dockerfile` does not depend on the upstream RunPod Hub image.
+It pins the ComfyUI and custom-node commits and downloads the three required
+weights at immutable Hugging Face revisions. Publish the resulting image as an
+immutable GHCR tag, for example:
+
+```text
+ghcr.io/pedroibr/runpod-studio-upscale-interpolation:v1.0.0
+```
+
+After this first build, handler changes should use that image as their base so
+the ComfyUI and model layers remain cached.
 
 ### RunPod Studio task contract
 
