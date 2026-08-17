@@ -26,7 +26,27 @@ if [ $wait_count -ge $max_wait ]; then
     exit 1
 fi
 
-# Start the handler in the foreground
-# 이 스크립트가 컨테이너의 메인 프로세스가 됩니다.
-echo "Starting the handler..."
-exec python handler.py
+# RunPod uses the same image for two different workflows:
+#
+#   MODE_TO_RUN=serverless (default)
+#       The SDK owns the foreground process and receives jobs from RunPod.
+#   MODE_TO_RUN=pod
+#       Keep ComfyUI alive for interactive HTTP/GUI smoke tests.  Starting
+#       handler.py here would make the SDK look for test_input.json and exit,
+#       which caused the Pod to restart in a loop.
+mode="${MODE_TO_RUN:-serverless}"
+case "$mode" in
+  serverless)
+    echo "Starting the Serverless handler..."
+    exec python handler.py
+    ;;
+  pod)
+    echo "Pod mode enabled; ComfyUI is ready on port 8188."
+    echo "The handler is intentionally not started in Pod mode."
+    exec tail -f /dev/null
+    ;;
+  *)
+    echo "Invalid MODE_TO_RUN='$mode' (expected 'serverless' or 'pod')" >&2
+    exit 2
+    ;;
+esac
