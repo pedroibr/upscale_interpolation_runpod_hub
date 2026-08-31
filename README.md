@@ -1,11 +1,11 @@
 # RunPod Studio — Video Upscale & Frame Interpolation
 [한국어 README 보기](README_kr.md)
 
-This RunPod Studio fork builds an independent image containing the CUDA base,
-pinned ComfyUI/custom nodes, SeedVR2 and RIFE weights, and a stable handler for
-upscale-only, interpolation-only, and combined video processing. It also
-supports direct Cloudflare R2 output. The expensive model layers are built once
-and reused by later handler-only image releases.
+This RunPod Studio fork builds an independent, self-contained image containing
+the CUDA base, pinned ComfyUI/custom nodes, SeedVR2 and RIFE weights, and a
+stable handler for upscale-only, interpolation-only, and combined video
+processing. It supports direct Cloudflare R2 output; the current Gateway
+endpoint does not require a RunPod network volume.
 
 [![Runpod](https://api.runpod.io/badge/wlsdml1114/upscale_interpolation_runpod_hub)](https://console.runpod.io/hub/wlsdml1114/upscale_interpolation_runpod_hub)
 
@@ -13,7 +13,9 @@ and reused by later handler-only image releases.
 
 [![EnguiStudio](https://raw.githubusercontent.com/wlsdml1114/Engui_Studio/main/assets/banner.png)](https://github.com/wlsdml1114/Engui_Studio)
 
-This InfiniteTalk template is primarily designed for **Engui Studio**, a comprehensive AI model management platform. While it can be used via API, Engui Studio provides enhanced features and broader model support.
+This worker is consumed by the RunPod Studio Gateway. The upstream Engui Studio
+integration remains useful as a reference, but Gateway/R2 is the canonical
+production path for this project.
 
 **Engui Studio Benefits:**
 - **Expanded Model Support**: Access to a wider variety of AI models beyond what's available through API
@@ -34,7 +36,7 @@ This InfiniteTalk template is primarily designed for **Engui Studio**, a compreh
 
 ## 🚀 RunPod Serverless Template
 
-### Building our own image
+### Building the self-contained image
 
 The production `Dockerfile` does not depend on the upstream RunPod Hub image.
 It pins the ComfyUI and custom-node commits and downloads the three required
@@ -46,7 +48,8 @@ ghcr.io/pedroibr/runpod-studio-upscale-interpolation:v1.0.0
 ```
 
 After this first build, handler changes should use that image as their base so
-the ComfyUI and model layers remain cached.
+the ComfyUI and model layers remain cached. Publish immutable tags and configure
+the Gateway with the resulting endpoint ID through Railway secrets.
 
 ### RunPod Studio task contract
 
@@ -81,7 +84,7 @@ The `input` object must contain the following fields. Videos can be input using 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `task_type` | `string` | No | `"upscale"` | Task type: `"upscale"` (upscaling only) or `"upscale_and_interpolation"` (upscaling + frame interpolation) |
-| `network_volume` | `boolean` | No | `false` | Whether to use network volume for output. If `true`, returns file path; if `false`, returns Base64 encoded data |
+| `network_volume` | `boolean` | No | `false` | Legacy debugging option. Production uses R2 and should leave this unset. |
 
 #### Video Input (use only one)
 | Parameter | Type | Required | Default | Description |
@@ -184,13 +187,13 @@ If the job fails, it returns a JSON object containing an error message.
 1.  Create a Serverless Endpoint on RunPod based on this repository.
 2.  Once the build is complete and the endpoint is active, submit jobs via HTTP POST requests according to the API Reference below.
 
-### 📁 Using Network Volumes
+### 📁 Input and output storage
 
-Instead of directly transmitting Base64 encoded files, you can use RunPod's Network Volumes to handle large files. This is especially useful when dealing with large video files.
-
-1.  **Create and Connect Network Volume**: Create a Network Volume (e.g., S3-based volume) from the RunPod dashboard and connect it to your Serverless Endpoint settings.
-2.  **Upload Files**: Upload the video files you want to use to the created Network Volume.
-3.  **Specify Paths**: When making an API request, specify the file paths within the Network Volume for `video_path`. For example, if the volume is mounted at `/my_volume` and you use `input_video.mp4`, the path would be `"/my_volume/input_video.mp4"`.
+The Gateway uploads user media to Cloudflare R2 and passes a temporary HTTPS
+URL as `video_url` or `image_url`. The worker uploads the generated artifact
+back to R2 and returns its metadata. Local paths and network-volume paths are
+reserved for isolated debugging; the current production endpoint has no model
+or output volume attached.
 
 ## 🔧 Workflow Configuration
 
